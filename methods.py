@@ -1,6 +1,11 @@
 import numpy as np
 from scipy.optimize import minimize
 import scipy
+import pyro, torch
+import pyro.contrib.gp as gp
+import pyro.distributions as dist
+from pyro.infer import (MCMC, NUTS, HMC)
+
 
 class Vanilla_GP:
     '''This class takes in the parameters without log transformation at first'''
@@ -21,7 +26,7 @@ class Vanilla_GP:
     def dk2(self, r, p):
         return p[0]*(3 * r**2/p[1]**3) * np.exp(-np.sqrt(3)*np.abs(r)/p[1])
 
-    def gp_solve(self, x, y,  xt = None, opt = True):
+    def gp_solve(self, x, y,  xt = None, opt = True, get_likelihood = False):
         '''
         Args:
         params  - Log-Parameter (sigma2, magnSigma2, lengthscale)
@@ -42,7 +47,11 @@ class Vanilla_GP:
         ub      - 95% confidence upper bound
         '''
 
-        param = np.exp(self.params)
+        if get_likelihood:
+            param = self.params
+        else:
+            param = np.exp(self.params)
+
         sigma2 = param[0]
         magnSigma2 = param[1]
         lengthscale = param[2]
@@ -116,7 +125,7 @@ class Vanilla_GP:
         
         result = minimize(fun = objective_function, 
                           x0 = np.log(self.params), 
-                          method = 'BFGS',          # Nelder-Mead, Powell, BFGS, CG, Newton-CG
+                          method = 'Powell',          # Nelder-Mead, Powell, BFGS, CG, Newton-CG
                           jac = False, 
                           options={'disp': True})
         
@@ -128,7 +137,7 @@ class Vanilla_GP:
     
 
 class IHGP:
-
+    '''This class also takes in params without log transformation'''
     def __init__(self, params):
         # Initialize model parameters
         self.params = params
@@ -175,7 +184,7 @@ class IHGP:
             return F, L, Qc, H, Pinf
         
 
-    def ihgpr(self, x, y, xt = None, opt = False):
+    def ihgpr(self, x, y, xt = None, opt = False, get_likelihood = False):
         '''
         Adapted from IHGP Paper: A. Solin et.al. (2018)
 
@@ -217,7 +226,10 @@ class IHGP:
         if np.std(np.diff(xall)) > 1e-12:
             raise Exception('This function only accepts equidistant time-stamps only')
         
-        param = np.exp(self.params)
+        if get_likelihood:
+            param = self.params
+        else:
+            param = np.exp(self.params)
         
         d = len(x)
         sigma2 = param[0]
@@ -429,7 +441,7 @@ class IHGP:
         
         result = minimize(fun = objective_function, 
                           x0 = np.log(self.params), 
-                          method = 'BFGS',          # Nelder-Mead, Powell, BFGS, CG, Newton-CG
+                          method = 'Powell',          # Nelder-Mead, Powell, BFGS, CG, Newton-CG
                           jac = False, 
                           options={'disp': True})
         
@@ -440,4 +452,120 @@ class IHGP:
         # Reurns optimized params
         return np.exp(self.params)
  
+
+class MarkovChainMC:
+    def __init__(self, x, y, num_samples, num_warmups):
+        if isinstance(x, np.ndarray):
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.x = torch.tensor(x, device = self.device).reshape(-1,1)
+            self.y = torch.tensor(y, device = self.device).reshape(-1,1)
+        
+        self.num_samples = num_samples
+        self.num_warmups = num_warmups
+
+    def kernel(self, x1, x2 ,obs_noise, variance, lengthscale):
+        distance = torch.abs(x1 - x2.T)
+        sqrt3 = torch.sqrt(torch.tensor(3.0, device = self.device))
+        K = variance * (1.0 + sqrt3 * distance / lengthscale) * torch.exp(-sqrt3 * distance / lengthscale)
+        return K + torch.eye(x1.shape[0], device = self.device) * obs_noise
     
+    def model(self, x, y):
+        # set uninformative prior
+        var = pyro.sample('Kernel_amplitude', dist.LogNormal(loc = 0.0, scale = 1.0)) # mean and std 0.2 1.8 ->log normal # UNif -7.0 - 2.0/3.0
+        noise = pyro.sample('Kernel_noise', dist.LogNormal(loc = 0.0, scale = 1.0))
+        length = pyro.sample('Kernel_length', dist.LogNormal(loc = 0.0, scale = 1.0))
+
+        var_ = pyro.deterministic('kernel_amplitude_', torch.exp(var))
+        noise_ = pyro.deterministic('kernel_noise_', torch.exp(noise))
+        length_ = pyro.deterministic('kernel_length_', torch.exp(length))
+
+        # compute kernel
+        K = self.kernel(x, x, noise_, var_, length_)
+
+        # sample according to the standard gaussian process i.e. get samples from GP conditioned on the observations
+        with pyro.plate('plate'):
+            pyro.sample('y',
+                        dist.MultivariateNormal(loc = torch.zeros(x.shape[0], device = self.device), covariance_matrix = K),
+                        obs = y)
+        
+    def run_inference(self):
+        #model_kernel = HMC(self.model, step_size = 0.01, num_steps = 5)
+        model_kernel = NUTS(self.model)
+        mcmc = MCMC(model_kernel, num_samples = self.num_samples, warmup_steps = self.num_warmups, num_chains = 1)
+        mcmc.run(self.x, self.y)
+        mcmc.summary()
+        return mcmc.get_samples()
+    
+
+class MaximumAposteriori:
+    '''
+    If getting MAP value, simply pass parameters and run map_objective() to get the corresponding MPA values. Useful when plotting MAP landscape
+    If optimizing, pass parameters and run run_inference() to get optimized parameters. Returned as log-scale.
+    '''
+    def __init__(self, x, y, init_params, num_steps, learning_rate = 0.005):
+        if isinstance(x, np.ndarray):
+            self.x = torch.tensor(x)
+            self.y = torch.tensor(y)
+            self.params = torch.tensor(init_params) # noise_var, amp_var, length
+            self.lr = learning_rate
+        
+        self.num_steps = num_steps
+
+
+    def kernel(self, x1, x2 ,obs_noise, variance, lengthscale):
+        x1 = x1.reshape(-1,1)
+        x2 = x2.reshape(-1,1)
+        distance = torch.abs(x1 - x2.T)
+        sqrt3 = torch.sqrt(torch.tensor(3.0))
+        K = variance * (1.0 + sqrt3 * distance / lengthscale) * torch.exp(-sqrt3 * distance / lengthscale)
+        return K + torch.eye(x1.shape[0]) * obs_noise
+
+
+    def map_objective(self):
+        '''Priors are assumed to be sampled from LogNormal (0.0, 1.0)'''
+        pyro.clear_param_store()
+        Ky = self.kernel(self.x, self.x, self.params[0], self.params[1], self.params[2])
+        L = torch.linalg.cholesky(Ky) + 1e-14
+
+        # reshape 'y' without modifying global 'y'
+        y = self.y.reshape(-1,1)
+        α = torch.linalg.solve(L.T, torch.linalg.solve(L, y))
+
+        # Likelihood Term
+        neg_log_likelihood = 0.5 * y.T @ α + 0.5 * 2 * torch.sum(torch.log(torch.diag(L))) +  0.5 * self.x.shape[0] * torch.log(torch.tensor(2.0 * torch.pi))
+        
+        # Prior
+        neg_log_prior = 0
+        for theta_j in (self.params):
+            neg_log_prior += 0.5 * (torch.log(theta_j)**2) + torch.log(theta_j) + 0.5 * torch.log(torch.tensor(2.0 * torch.pi))
+
+        return neg_log_likelihood.item() + neg_log_prior.item()
+    
+
+    def run_inference(self):
+        pyro.clear_param_store()
+        kernel = gp.kernels.Matern32(input_dim = 1, variance = self.params[1], lengthscale = self.params[2])
+
+        gpr = gp.models.GPRegression(X = self.x, y = self.y, kernel= kernel, noise = self.params[0])
+
+        # priors have support on the positive reals
+        gpr.kernel.variance = pyro.nn.PyroSample(dist.LogNormal(loc = 0.0, scale = 1.0))
+        gpr.kernel.lengthscale = pyro.nn.PyroSample(dist.LogNormal(loc = 0.0, scale = 1.0))
+
+        optimizer = torch.optim.Adam(params = gpr.parameters(), lr = self.lr)
+        loss_fn = pyro.infer.Trace_ELBO().differentiable_loss
+
+        for i in range(self.num_steps):
+            optimizer.zero_grad()
+            loss = loss_fn(gpr.model, gpr.guide)
+            loss.backward()
+            optimizer.step()
+
+        gpr.set_mode('guide')
+
+        print ('----Exponentiated Params----')
+        print("noise = {}".format(gpr.noise))
+        print("variance = {}".format(gpr.kernel.variance))
+        print("lengthscale = {}".format(gpr.kernel.lengthscale))
+
+        return torch.log(gpr.noise).detach().item(), torch.log(gpr.kernel.variance).detach().item(), torch.log(gpr.kernel.lengthscale).detach().item()
