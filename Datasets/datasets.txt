@@ -1,0 +1,8 @@
+1. Sunspot Number Yearly Mean
+https://www.sidc.be/SILSO/datafiles
+
+2. Daily Number of Arrival/Departure Flights
+https://www.eurocontrol.int/Economics/2023-DailyTrafficVariation-States.html   >> Use Moldova
+
+3. Synthetic Data: 
+y = -exp(-xb^2/2). (4*xb^2 - 2) . cos(xb) . xb^(1/3) + N(0, 0.1)     where; xb = x-4 and x = np.linspace(0,9,200) & seed = 53
